@@ -166,3 +166,83 @@ def map_motifs(regions_df,
     non_motif_df.to_csv(non_motif_outpath, index=False)
     logger.info(f"Non-motif regions saved to {non_motif_outpath}.")
 
+
+
+def map_motif_finemo(hits_df, regions_df, motif_outpath, non_motif_outpath,
+                     score_field="hit_coefficient_global"):
+    """Convert Fi-NeMo hits into a ``map_motifs``-identical ``motif_locs`` CSV.
+
+    Fi-NeMo reports hits with coordinates relative to the fake ``regions.bed``
+    written by :func:`deepISA.discover.finemo.build_finemo_input` (chrom
+    ``chrFake``, 0..L); the true region string is preserved in ``peak_name``.
+    This function reverses that mapping: ``peak_name`` ("chrom:start-end") is
+    parsed back to genomic coordinates, hit start/end become ``start_rel`` /
+    ``end_rel`` plus absolute ``start`` / ``end`` — the exact column contract
+    of :func:`map_motifs`::
+
+        chrom, start, end, start_rel, end_rel, tf, score, strand, region
+
+    ``tf`` is the annotated ``TF_Name`` when available (falling back to the raw
+    motif id), ``score`` is Fi-NeMo's ``hit_coefficient_global`` by default.
+
+    Parameters
+    ----------
+    hits_df : pd.DataFrame
+        Annotated hits from
+        :func:`deepISA.discover.finemo.load_hits_with_annotation` (needs
+        ``peak_name``, ``start``, ``end``, ``strand`` and the score field).
+    regions_df : pd.DataFrame
+        The positive regions (chrom/start/end) — used for the non-motif
+        complement, mirroring :func:`map_motifs`.
+    motif_outpath, non_motif_outpath : str
+        Destination CSVs, same pair :func:`map_motifs` writes.
+    score_field : str
+        Hits column used as the ``score``.
+
+    Returns
+    -------
+    pd.DataFrame
+        The motif locations written to ``motif_outpath``.
+    """
+    logger.info("Mapping Fi-NeMo hits to motif locations.")
+    df = hits_df.dropna(subset=["peak_name", "start", "end"]).reset_index(drop=True)
+
+    region = df["peak_name"].astype(str)
+    parsed = region.str.extract(r"^(?P<chrom>[^:]+):(?P<rstart>\d+)-(?P<rend>\d+)$")
+    if parsed["chrom"].isna().any():
+        bad = region[parsed["chrom"].isna()].unique()[:5]
+        raise ValueError(
+            f"Cannot parse region string from peak_name (examples: {bad.tolist()}). "
+            "Fi-NeMo hits must be produced with region-string ids "
+            "(build_finemo_input(ids=...))."
+        )
+    df["region"] = region
+    df["chrom"] = parsed["chrom"].to_numpy()
+    rstart = parsed["rstart"].astype(int).to_numpy()
+    df["start_rel"] = df["start"].astype(int)
+    df["end_rel"] = df["end"].astype(int)
+    df["start"] = rstart + df["start_rel"].to_numpy()
+    df["end"] = rstart + df["end_rel"].to_numpy()
+    fallback = df["motif_name"].astype(str).str.removeprefix("pos_patterns.")
+    df["tf"] = df["TF_Name"].where(df["TF_Name"].ne("Unknown"), fallback)
+    df["score"] = pd.to_numeric(df[score_field], errors="coerce").fillna(0.0)
+
+    cols = ["chrom", "start", "end", "start_rel", "end_rel", "tf",
+            "score", "strand", "region"]
+    motif_df = (df[cols]
+                .apply(lambda s: s.str.upper() if s.name == "tf" else s)
+                .drop_duplicates()
+                .sort_values(["region", "start"])
+                .reset_index(drop=True))
+
+    remove_if_exists(motif_outpath)
+    motif_df.to_csv(motif_outpath, index=False)
+    logger.info(f"Fi-NeMo motif locations ({len(motif_df)}) saved to {motif_outpath}.")
+
+    # get_non_motifs flank-expands its motif frame in place (-5/+5) — hand it
+    # a copy so the returned / written motif coordinates stay unexpanded.
+    regions_df = regions_df.drop_duplicates(subset=['chrom', 'start', 'end']).reset_index(drop=True)
+    non_motif_df = get_non_motifs(regions_df, motif_df.copy())
+    non_motif_df.to_csv(non_motif_outpath, index=False)
+    logger.info(f"Non-motif regions saved to {non_motif_outpath}.")
+    return motif_df

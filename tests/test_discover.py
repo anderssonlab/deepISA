@@ -12,6 +12,11 @@ import pytest
 import torch
 
 from deepISA.model.cnn import Conv
+from deepISA.score.mapper import map_motif_finemo
+from deepISA.quickstart import QuickStart
+import os
+from pathlib import Path
+
 from deepISA.discover import (
     build_finemo_db,
     build_finemo_input,
@@ -633,56 +638,229 @@ class TestQuickStartSelection:
 # QuickStart orchestration: CLI-facing methods with the external CLI stubbed out
 # ---------------------------------------------------------------------------
 class TestQuickStartOrchestration:
-    def test_run_modisco_nonzero_first_track(self, tmp_path, monkeypatch):
-        """Regression: the H5 slot index is not the model-output index.
-        run_modisco(tracks=[1]) used to pass track_index=1 to a 1-slot H5 and
-        crash with IndexError; slot 0 (the first requested track) is the pick."""
-        from deepISA.quickstart import QuickStart
+    """run_isa(isa_config={"method": ["modisco-finemo"]}) end-to-end.
+
+    The external CLIs are stubbed with realistic artefacts (a modisco results
+    H5 in the true layout; a hits.tsv whose peak_name holds region strings);
+    everything else — attribution, NPZ prep, hits annotation, map_motif_finemo
+    and all downstream ISA stages — runs for real on a tiny model.
+    """
+
+    @staticmethod
+    def _write_fake_modisco_h5(out_h5, motif_len=10):
+        import h5py
+        with h5py.File(out_h5, "w") as f:
+            pos = f.create_group("pos_patterns")
+            p0 = pos.create_group("pattern_0")
+            sub = p0.create_group("subpattern_0")
+            sub.create_dataset("contrib_scores",
+                               data=np.random.rand(motif_len, 4).astype(np.float32))
+            sub.create_dataset("sequence", data=np.eye(4, dtype=np.float32)[:motif_len])
+            sub.create_group("seqlets").create_dataset("n_seqlets", data=np.array([7]))
+
+    def test_run_isa_modisco_finemo_end_to_end(self, tmp_path, monkeypatch):
         import deepISA.quickstart as qs
 
         fa = str(tmp_path / "syn.fa")
-        _write_mini_fasta(fa, "ACGT" * 5)
-        df = pd.DataFrame({"chrom": ["chrSyn"], "start": [0], "end": [20]})
+        with open(fa, "w") as fh:
+            fh.write(">chrA\n" + "ACGT" * 150 + "\n>chrB\n" + "ACGT" * 150 + "\n")
+        df = pd.DataFrame({
+            "chrom": ["chrA", "chrB"], "start": [0, 0], "end": [600, 600],
+        })
         pipe = QuickStart(results_dir=str(tmp_path / "res"), fasta_path=fa,
                           df_input=df, device="cpu")
-        pipe.define_model({"seq_len": 20, "ks": [7, 5], "cs": [8, 8],
-                           "ds": [1, 2], "dropout": 0.0}, mode="dual")
+        pipe.define_model({"seq_len": 600, "ks": [7], "cs": [8], "ds": [1],
+                           "dropout": 0.0}, mode="dual")
 
-        recorded = {}
-        def fake_cli(ohe_npz, hyp_npz, out_h5, n_seqlets=50000, window=None):
-            recorded["ohe"], recorded["hyp"] = ohe_npz, hyp_npz
+        # stub `modisco motifs`: write a valid results H5
+        def fake_modisco_cli(ohe_npz, hyp_npz, out_h5, n_seqlets=50000, window=None):
+            self._write_fake_modisco_h5(out_h5)
             return out_h5
-        monkeypatch.setattr(qs, "run_modisco", fake_cli)
+        monkeypatch.setattr(qs, "run_modisco", fake_modisco_cli)
 
-        out = pipe.run_modisco(tracks=[1], df_pos=df, n_refs=2, attr_batch_size=2,
-                               save_motifs_csv=False, top_frac=None, drop_N=False)
-        assert out == pipe.files["modisco_h5"]
-        # the NPZ fed to the (stubbed) CLI holds slot 0 verbatim
-        seqs_slot, hyp_slot, _ = read_attribution_h5(pipe.files["attr_h5"], track_index=0)
-        with np.load(recorded["hyp"]) as dz:
-            npz_hyp = dz[dz.files[0]]
-        assert npz_hyp.shape == (1, 4, 20)
-        assert np.array_equal(npz_hyp, hyp_slot)
+        # stub `finemo call-hits`: hits.tsv with region-string peak_names
+        def fake_finemo_cli(npz_path, out_dir, motif_db_h5, lam=0.7, max_steps=10000):
+            hits = pd.DataFrame({
+                "peak_name": ["chrA:0-600"] * 3 + ["chrB:0-600"] * 2,
+                "start": [50, 150, 250, 80, 180],
+                "end":   [60, 160, 260, 90, 190],
+                "strand": ["+", "-", "+", "+", "-"],
+                "motif_name": ["pos_patterns.pattern_0"] * 5,
+                "hit_coefficient_global": [1.5, 0.7, 0.9, 1.1, 0.6],
+            })
+            out = Path(out_dir) / "hits.tsv"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            hits.to_csv(out, sep="\t", index=False)
+            return str(out)
+        monkeypatch.setattr(qs, "run_finemo_scan", fake_finemo_cli)
 
-    def test_run_motif_discovery_forwards_curation_kwargs(self, tmp_path):
-        """Regression: the 4 curation kwargs must reach BOTH methods (they used
-        to be split into modisco_keys only, silently dropping them for finemo)."""
-        from deepISA.quickstart import QuickStart
+        # tracks=[1]: regression guard — discovery must use H5 slot 0 (the
+        # first requested track), never the model-output index.
+        pipe.run_isa(
+            jaspar_path="unused (method has no JASPAR)",
+            isa_config={
+                "method": ["modisco-finemo"],
+                "tracks": [1],
+                "discovery_top_frac": None,      # keep both regions
+                "n_samples": 12, "n_bins": 2,
+                "num_regions_per_batch": 10, "pred_batch_size": 4,
+                "receptive_field": 255,
+            },
+        )
 
-        pipe = QuickStart(results_dir=str(tmp_path / "res"), fasta_path="unused.fa",
+        # motif_locs: map_motifs-identical contract; region start is 0 so
+        # absolute == relative here — coordinate reversal verified separately
+        motif_df = pd.read_csv(pipe.files["motif_locs"])
+        assert list(motif_df.columns) == ["chrom", "start", "end", "start_rel",
+                                          "end_rel", "tf", "score", "strand", "region"]
+        assert len(motif_df) == 5
+        row = motif_df.iloc[0]
+        assert row["chrom"] == "chrA" and row["start"] == 50 and row["end"] == 60
+        assert row["start_rel"] == 50 and row["strand"] == "+"
+
+        # downstream stages ran on the finemo-derived motif_locs
+        for key in ("isa_single", "isa_combi", "non_motif_isa", "imp_tf"):
+            assert os.path.exists(pipe.files[key]), key
+        assert len(pd.read_csv(pipe.files["isa_single"])) == 5
+
+        # discovery products live under Data/Motif_discovery/
+        assert "Motif_discovery" in pipe.files["attr_h5"].replace("\\", "/")
+        assert os.path.exists(pipe.files["modisco_h5"])
+        assert os.path.exists(pipe.files["finemo_hits"])
+        assert os.path.exists(pipe.files["discovered_motifs"])
+
+    def test_run_isa_unknown_method_rejected(self, tmp_path):
+        pipe = QuickStart(results_dir=str(tmp_path / "res"), fasta_path="f.fa",
                           df_input=pd.DataFrame({"chrom": ["chr1"], "start": [0],
                                                  "end": [10]}), device="cpu")
-        calls = {}
-        pipe.run_modisco = lambda **kw: calls.setdefault("modisco", kw)
-        pipe.run_finemo = lambda **kw: calls.setdefault("finemo", kw)
+        pipe.model = object()  # pass the define_model guard
+        with pytest.raises(ValueError, match="Unknown isa_config method"):
+            pipe.run_isa(jaspar_path="x",
+                         isa_config={"method": ["gpt4"]},
+                         start_from="map_motifs")
 
-        pipe.run_motif_discovery(tracks=[0], top_frac=0.2, rank_by="signal",
-                                 drop_N=False, max_drop_frac=0.3,
-                                 lam=0.5, n_seqlets=99)
-        cur = {"top_frac": 0.2, "rank_by": "signal",
-               "drop_N": False, "max_drop_frac": 0.3}
-        for k, v in cur.items():
-            assert calls["modisco"].get(k) == v
-            assert calls["finemo"].get(k) == v, f"{k} not forwarded to run_finemo"
-        assert calls["modisco"]["n_seqlets"] == 99
-        assert calls["finemo"]["lam"] == 0.5
+
+class TestMapMotifFinemo:
+    """Contract of map_motif_finemo: identical columns to map_motifs output."""
+
+    def _hits(self):
+        return pd.DataFrame({
+            "peak_name": ["chr1:1000-1600", "chr1:1000-1600", "chr2:50-650"],
+            "start": [10, 300, 5], "end": [24, 314, 19],
+            "strand": ["+", "-", "+"],
+            "motif_name": ["pos_patterns.pattern_0",
+                           "pos_patterns.pattern_0",
+                           "pos_patterns.pattern_9"],
+            "TF_Name": ["GATA1", "GATA1", "Unknown"],
+            "hit_coefficient_global": [1.5, 0.7, 0.9],
+        })
+
+    def test_columns_match_map_motifs_contract(self, tmp_path):
+        regions = pd.DataFrame({"chrom": ["chr1", "chr2"],
+                                "start": [1000, 50], "end": [1600, 650]})
+        mo, no = tmp_path / "motif.csv", tmp_path / "nonmotif.csv"
+        out = map_motif_finemo(self._hits(), regions, str(mo), str(no))
+        assert list(out.columns) == ["chrom", "start", "end", "start_rel",
+                                     "end_rel", "tf", "score", "strand", "region"]
+
+    def test_coordinates_reverse_the_fake_bed(self, tmp_path):
+        regions = pd.DataFrame({"chrom": ["chr1", "chr2"],
+                                "start": [1000, 50], "end": [1600, 650]})
+        mo, no = tmp_path / "motif.csv", tmp_path / "nonmotif.csv"
+        out = map_motif_finemo(self._hits(), regions, str(mo), str(no))
+        # chr1 hits: absolute = 1000 + relative
+        assert list(out.loc[out.chrom == "chr1", "start"]) == [1010, 1300]
+        assert list(out.loc[out.chrom == "chr1", "end"]) == [1024, 1314]
+        assert list(out.loc[out.chrom == "chr1", "start_rel"]) == [10, 300]
+        # chr2 (region start 50): 50 + 5 = 55
+        assert out.loc[out.chrom == "chr2", "start"].iloc[0] == 55
+
+    def test_unknown_tf_falls_back_to_stripped_motif_id(self, tmp_path):
+        regions = pd.DataFrame({"chrom": ["chr2"], "start": [50], "end": [650]})
+        mo, no = tmp_path / "motif.csv", tmp_path / "nonmotif.csv"
+        out = map_motif_finemo(self._hits(), regions, str(mo), str(no))
+        tf_chr2 = out.loc[out.chrom == "chr2", "tf"].iloc[0]
+        assert tf_chr2 == "PATTERN_9"          # pos_patterns. prefix stripped
+        assert (out.loc[out.chrom == "chr1", "tf"] == "GATA1").all()
+
+    def test_non_motifs_written_via_mapper_helper(self, tmp_path):
+        regions = pd.DataFrame({"chrom": ["chr1"], "start": [1000], "end": [1600]})
+        mo, no = tmp_path / "motif.csv", tmp_path / "nonmotif.csv"
+        map_motif_finemo(self._hits(), regions, str(mo), str(no))
+        non = pd.read_csv(no)
+        # region is split around the two chr1 motifs -> non-empty complement
+        assert len(non) >= 1
+
+    def test_unparseable_peak_name_raises(self, tmp_path):
+        regions = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [600]})
+        bad = self._hits()
+        bad["peak_name"] = "seq_0"
+        with pytest.raises(ValueError, match="peak_name"):
+            map_motif_finemo(bad, regions, str(tmp_path / "m.csv"),
+                             str(tmp_path / "n.csv"))
+
+    def test_run_isa_union_of_jaspar_and_finemo(self, tmp_path, monkeypatch):
+        """method=["JASPAR", "modisco-finemo"]: both sources run, their hits
+        are unioned (deduplicated) into motif_locs, downstream ISA proceeds."""
+        import deepISA.quickstart as qs
+
+        fa = str(tmp_path / "syn.fa")
+        with open(fa, "w") as fh:
+            fh.write(">chrA\n" + "ACGT" * 150 + "\n")
+        df = pd.DataFrame({"chrom": ["chrA"], "start": [0], "end": [600]})
+        pipe = QuickStart(results_dir=str(tmp_path / "res"), fasta_path=fa,
+                          df_input=df, device="cpu")
+        pipe.define_model({"seq_len": 600, "ks": [7], "cs": [8], "ds": [1],
+                           "dropout": 0.0}, mode="regression")
+
+        # stub the JASPAR mapper: one known-TF hit at 400-410
+        def fake_map_motifs(regions_df, jaspar_path, motif_outpath,
+                            non_motif_outpath, expressed_tfs=None,
+                            motif_score_thresh=500, remap_path=None):
+            pd.DataFrame([{"chrom": "chrA", "start": 400, "end": 410,
+                           "start_rel": 400, "end_rel": 410, "tf": "CTCF",
+                           "score": 700, "strand": "+", "region": "chrA:0-600"}]
+                         ).to_csv(motif_outpath, index=False)
+        monkeypatch.setattr(qs, "map_motifs", fake_map_motifs)
+
+        def fake_modisco_cli(ohe_npz, hyp_npz, out_h5, n_seqlets=50000, window=None):
+            TestQuickStartOrchestration._write_fake_modisco_h5(out_h5)
+            return out_h5
+        monkeypatch.setattr(qs, "run_modisco", fake_modisco_cli)
+
+        def fake_finemo_cli(npz_path, out_dir, motif_db_h5, lam=0.7, max_steps=10000):
+            hits = pd.DataFrame({
+                "peak_name": ["chrA:0-600"] * 2,
+                "start": [50, 100],            # 40bp apart -> one combi pair
+                "end": [60, 110],
+                "strand": ["+", "+"],
+                "motif_name": ["pos_patterns.pattern_0"] * 2,
+                "hit_coefficient_global": [1.5, 0.9],
+            })
+            out = Path(out_dir) / "hits.tsv"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            hits.to_csv(out, sep="\t", index=False)
+            return str(out)
+        monkeypatch.setattr(qs, "run_finemo_scan", fake_finemo_cli)
+
+        pipe.run_isa(
+            jaspar_path="stubbed",
+            isa_config={
+                "method": ["JASPAR", "modisco-finemo"],
+                "discovery_top_frac": None,
+                "n_samples": 12, "n_bins": 2,
+                "num_regions_per_batch": 10, "pred_batch_size": 4,
+                "receptive_field": 255,
+            },
+        )
+
+        motif_df = pd.read_csv(pipe.files["motif_locs"])
+        # JASPAR hit (400-410, CTCF) + finemo hits (50-60, 400-410) = 3 rows
+        # (same interval from two sources is kept once per tf/score tuple)
+        assert len(motif_df) == 3, motif_df.to_dict("records")
+        tfs = set(motif_df["tf"])
+        assert "CTCF" in tfs                                   # JASPAR side
+        assert any(t.startswith("PATTERN") for t in tfs)       # finemo side
+        # downstream stages ran on the union
+        assert os.path.exists(pipe.files["isa_single"])
+        assert len(pd.read_csv(pipe.files["isa_single"])) == 3

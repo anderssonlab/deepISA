@@ -9,7 +9,7 @@ from loguru import logger
 from deepISA.model.cnn import Conv
 from deepISA.model.preprocess import compile_training_data
 from deepISA.model.train import train_model
-from deepISA.score.mapper import map_motifs
+from deepISA.score.mapper import map_motifs, map_motif_finemo
 from deepISA.score.single_isa import run_single_isa, calc_pred_orig
 
 from deepISA.score.combi_isa import run_combi_isa
@@ -34,9 +34,8 @@ from deepISA.discover import (
     run_finemo_scan,
     load_hits_with_annotation,
     load_motifs,
-    run_motif_report,
-    cwm_to_meme,
 )
+from deepISA.discover.modisco import read_attribution_h5
 
 
 # Plot functions
@@ -101,10 +100,13 @@ class QuickStart:
         self.data_dir = os.path.join(self.results_dir, "Data")
         self.plots_dir = os.path.join(self.results_dir, "Plots")
         self.model_dir = os.path.join(self.results_dir, "Models")
+        # tf-modisco-lite / Fi-NeMo products live in their own subdirectory.
+        self.motif_dir = os.path.join(self.data_dir, "Motif_discovery")
         setup_logger(self.results_dir)
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.plots_dir, exist_ok=True)
         os.makedirs(self.model_dir, exist_ok=True)
+        os.makedirs(self.motif_dir, exist_ok=True)
         # register paths for key files that will be generated and used throughout the pipeline
         self.files = {
             "motif_locs":    os.path.join(self.data_dir, "motif_locs.csv"),
@@ -118,16 +120,15 @@ class QuickStart:
             "imp_tf":        os.path.join(self.data_dir, "tf_importance.csv"),
             "coop_tf_pair":  os.path.join(self.data_dir, "coop_tf_pair.csv"),
             "coop_tf":       os.path.join(self.data_dir, "coop_tf.csv"),
-            # Motif discovery (tf-modisco-lite + Fi-NeMo) -- registered lazily;
-            # these keys are populated by run_modisco()/run_finemo() and stay
-            # inert unless those methods are called.
-            "attr_h5":       os.path.join(self.data_dir, "attribution.h5"),
-            "modisco_h5":    os.path.join(self.data_dir, "modisco_results.h5"),
-            "discovered_motifs": os.path.join(self.data_dir, "discovered_motifs.csv"),
-            "finemo_npz":    os.path.join(self.data_dir, "finemo_input.npz"),
-            "finemo_hits":   os.path.join(self.data_dir, "finemo_hits.tsv"),
-            "motif_report":  os.path.join(self.results_dir, "MotifReport"),
-            "discovered_meme": os.path.join(self.data_dir, "discovered_motifs.meme"),
+            # Motif discovery (tf-modisco-lite + Fi-NeMo) products, written by
+            # the run_isa(isa_config={"method": [..., "modisco-finemo"]}) path.
+            "attr_h5":       os.path.join(self.motif_dir, "attribution.h5"),
+            "modisco_h5":    os.path.join(self.motif_dir, "modisco_results.h5"),
+            "discovered_motifs": os.path.join(self.motif_dir, "discovered_motifs.csv"),
+            "finemo_npz":    os.path.join(self.motif_dir, "finemo_input.npz"),
+            "finemo_hits":   os.path.join(self.motif_dir, "finemo_hits.tsv"),
+            "motif_report":  os.path.join(self.motif_dir, "MotifReport"),
+            "discovered_meme": os.path.join(self.motif_dir, "discovered_motifs.meme"),
         }
         self.fasta_path = fasta_path
         self.df_input = df_input # can be either positive or negative regions
@@ -350,24 +351,64 @@ class QuickStart:
         self.tracks = isa_config.get('tracks', self._default_tracks(self.model))
         start_idx = ISA_STAGES.index(start_from)
 
+        # Motif-location source(s): ["JASPAR"] (default, unchanged behaviour),
+        # ["modisco-finemo"] (de novo discovery on model attributions), or both
+        # (hits are unioned into motif_locs).
+        method = isa_config.get("method", ["JASPAR"])
+        if isinstance(method, str):
+            method = [method]
+        for m in method:
+            if m not in ("JASPAR", "modisco-finemo"):
+                raise ValueError(
+                    f"Unknown isa_config method {m!r}. "
+                    "Expected 'JASPAR' and/or 'modisco-finemo'."
+                )
+
         # 1. Motif Mapping
         if start_idx <= ISA_STAGES.index("map_motifs"):
-            logger.info("Running stage: map_motifs")
-            map_motifs(
-                regions_df=df_pos,
-                jaspar_path=jaspar_path,
-                motif_outpath=self.files["motif_locs"],
-                non_motif_outpath=self.files["non_motif_locs"],
-                motif_score_thresh=isa_config.get('motif_score_threshold', 500),
-                remap_path=isa_config.get('remap_path', None),
-                expressed_tfs=expressed_tfs
-            )
+            motif_frames = []
+            if "JASPAR" in method:
+                logger.info("Running stage: map_motifs (JASPAR)")
+                map_motifs(
+                    regions_df=df_pos,
+                    jaspar_path=jaspar_path,
+                    motif_outpath=self.files["motif_locs"],
+                    non_motif_outpath=self.files["non_motif_locs"],
+                    motif_score_thresh=isa_config.get('motif_score_threshold', 500),
+                    remap_path=isa_config.get('remap_path', None),
+                    expressed_tfs=expressed_tfs
+                )
 
-            if isa_config.get('subset_by_remap', False):
-                logger.info("Subsetting motif locations by ReMap evidence...")
-                df_temp = pd.read_csv(self.files["motif_locs"])
-                df_temp = df_temp[df_temp['remap_evidence'] == True].reset_index(drop=True)
-                df_temp.to_csv(self.files["motif_locs"], index=False)
+                if isa_config.get('subset_by_remap', False):
+                    logger.info("Subsetting motif locations by ReMap evidence...")
+                    df_temp = pd.read_csv(self.files["motif_locs"])
+                    df_temp = df_temp[df_temp['remap_evidence'] == True].reset_index(drop=True)
+                    df_temp.to_csv(self.files["motif_locs"], index=False)
+                motif_frames.append(pd.read_csv(self.files["motif_locs"]))
+
+            if "modisco-finemo" in method:
+                logger.info("Running stage: map_motifs (modisco-finemo)")
+                hits_df = self._discover_motifs_finemo(df_pos, isa_config)
+                finemo_df = map_motif_finemo(
+                    hits_df=hits_df,
+                    regions_df=df_pos,
+                    motif_outpath=self.files["motif_locs"],
+                    non_motif_outpath=self.files["non_motif_locs"],
+                )
+                motif_frames.append(finemo_df)
+
+            if len(motif_frames) > 1:
+                # Union of both sources; column order follows the JASPAR frame
+                # (extra columns such as remap_evidence are kept).
+                from deepISA.score.mapper import get_non_motifs
+                merged = (pd.concat(motif_frames, ignore_index=True)
+                          .drop_duplicates()
+                          .reset_index(drop=True))
+                merged.to_csv(self.files["motif_locs"], index=False)
+                get_non_motifs(df_pos, merged.copy()).to_csv(
+                    self.files["non_motif_locs"], index=False)
+                logger.info(f"Union motif locations from {method}: "
+                            f"{len(merged)} rows -> {self.files['motif_locs']}")
         else:
             logger.info(f"Skipping stage: map_motifs (start_from='{start_from}')")
 
@@ -657,112 +698,76 @@ class QuickStart:
             logger.info(f"Motif discovery input: top {top_frac:.0%} -> {len(df_pos)} regions.")
         return df_pos
 
-    def run_modisco(self,
-                    tracks=None,
-                    df_pos=None,
-                    n_refs=100,
-                    attr_batch_size=64,
-                    window=None,
-                    n_seqlets=50000,
-                    task_name="discovery",
-                    target_motif_len=40,
-                    save_motifs_csv=True,
-                    top_frac=0.1,
-                    rank_by=None,
-                    drop_N=True,
-                    max_drop_frac=0.2):
-        """Discover motifs with tf-modisco-lite from model attributions.
 
-        Runs: input-set curation -> attribution (tangermeme DeepLIFT-SHAP) ->
-        NPZ prep -> ``modisco motifs``. Requires the external ``modisco``
-        binary on PATH (see
-        :func:`deepISA.discover.modisco.run_modisco`).
+    # ------------------------------------------------------------------
+    # De novo motif discovery (tf-modisco-lite + Fi-NeMo) — internal stage
+    # of run_isa(isa_config={"method": [..., "modisco-finemo"]}). Products
+    # live under Data/Motif_discovery/ (self.files["attr_h5" ...]).
+    # ------------------------------------------------------------------
+    def _discover_motifs_finemo(self, df_pos, isa_config):
+        """Discover motifs de novo and scan every input region for hits.
 
-        Parameters
-        ----------
-        tracks : list of int, optional
-            Output tracks to attribute. Defaults to ``self.tracks`` if set, else
-            ``[0]``.
-        df_pos : pd.DataFrame, optional
-            Positive regions. Defaults to the same resolution logic as run_isa().
-        n_refs : int
-            Number of dinucleotide-shuffled references per attribution background.
-        attr_batch_size : int
-            Sequences per attribution batch (GPU memory trade-off).
-        window : int, optional
-            tf-modisco-lite ``-w``: window size around the center of each region
-            used for seqlet discovery. ``None`` (default) uses the full region
-            length (e.g. 600 for a 600bp model) -- the sequences themselves are
-            *not* trimmed, only this analysis window is set. Pass a smaller
-            value only to restrict discovery to the central portion.
-        n_seqlets : int
-            Maximum seqlets for tf-modisco-lite (``-n``).
-        task_name : str
-            Prefix for discovered motif ids.
-        target_motif_len : int
-            Length to center-crop discovered motifs to when saving the CSV.
-        save_motifs_csv : bool
-            If True, also materialize ``discovered_motifs.csv`` (one row per
-            motif with metadata) for downstream inspection.
-        top_frac : float or None
-            Keep only the top fraction of regions by activity (default 0.1 =
-            top 10%) so discovery focuses on sequences the model is confident
-            about. Ranked by model prediction on ``tracks[0]``, or by the
-            ``rank_by`` column when given. ``None`` disables ranking (all
-            regions are used).
-        rank_by : str, optional
-            Column in ``df_pos`` to rank by (e.g. a measured-signal column).
-            Defaults to model predictions.
-        drop_N : bool
-            Drop regions whose sequence contains unknown bases (N) instead of
-            imputing them (default True). Any N that still reaches attribution
-            is imputed with random ACGT there.
-        max_drop_frac : float
-            Safety valve for ``drop_N``: N-containing regions are dropped only
-            while they account for at most this fraction of the input
-            (default 0.2 = 20%). Beyond that, all regions are kept and their
-            N bases are imputed with random ACGT during attribution instead.
+        Runs the former run_modisco + run_finemo bodies as one pipeline:
+        input-set curation -> attribution (tangermeme DeepLIFT-SHAP) ->
+        ``modisco motifs`` -> Fi-NeMo input -> ``finemo call-hits`` ->
+        annotated hits (also saved to ``self.files["finemo_hits"]``).
+
+        All knobs come from ``isa_config`` with the previous defaults:
+        ``discovery_top_frac``, ``discovery_rank_by``, ``discovery_drop_N``,
+        ``discovery_max_drop_frac``, ``n_refs``, ``attr_batch_size``,
+        ``modisco_window``, ``modisco_n_seqlets``, ``finemo_lam``,
+        ``finemo_max_steps``.
+
+        Returns the annotated hits DataFrame (for map_motif_finemo).
         """
         if self.model is None:
             raise ValueError("Model not defined. Call define_model() first.")
+        tracks = list(getattr(self, "tracks", None) or [0])
 
-        tracks = list(tracks) if tracks is not None else list(getattr(self, "tracks", [0]))
-        df_pos = self._resolve_positives(df_pos)
-        df_pos = self._select_modisco_regions(
-            df_pos, tracks, top_frac=top_frac, rank_by=rank_by, drop_N=drop_N,
-            max_drop_frac=max_drop_frac,
-        )
-        if len(df_pos) == 0:
-            raise ValueError("Empty motif-discovery input set after curation.")
-        seqs_ohe = self._positives_to_onehot(df_pos)
-        ids = df_pos["region"].astype(str).tolist() if "region" in df_pos.columns else None
+        top_frac   = isa_config.get("discovery_top_frac", 0.1)
+        rank_by    = isa_config.get("discovery_rank_by", None)
+        drop_N     = isa_config.get("discovery_drop_N", True)
+        max_drop   = isa_config.get("discovery_max_drop_frac", 0.2)
+        n_refs     = isa_config.get("n_refs", 100)
+        attr_bs    = isa_config.get("attr_batch_size", 64)
+        window     = isa_config.get("modisco_window", None)
+        n_seqlets  = isa_config.get("modisco_n_seqlets", 50000)
+        lam        = isa_config.get("finemo_lam", 0.7)
+        max_steps  = isa_config.get("finemo_max_steps", 10000)
 
-        logger.info(f"Computing attribution for {len(seqs_ohe)} regions, tracks={tracks}.")
-        import numpy as np
-        row_sums = seqs_ohe.sum(axis=1)  # if shape (N,4,L)
-        bad_pos = np.where(row_sums != 1)
-        print("Num bad positions:", len(bad_pos[0]))
-        print("Num bad sequences:", len(np.unique(bad_pos[0])))
-                
-        compute_attribution(
-            model=self.model,
-            seqs_ohe=seqs_ohe,
-            tracks=tracks,
-            device=self.device,
-            n_refs=n_refs,
-            batch_size=attr_batch_size,
-            save_h5_path=self.files["attr_h5"],
-            ids=ids,
-        )
+        # Fresh discovery on a curated input set; an existing attribution H5
+        # is reused (same policy as before) so re-runs skip straight to finemo.
+        if not os.path.exists(self.files["attr_h5"]):
+            curated = self._select_modisco_regions(
+                df_pos, tracks, top_frac=top_frac, rank_by=rank_by,
+                drop_N=drop_N, max_drop_frac=max_drop)
+            if len(curated) == 0:
+                raise ValueError("Empty motif-discovery input set after curation.")
+            if "region" not in curated.columns:
+                # Region strings become Fi-NeMo's peak_name and are parsed back
+                # into genomic coordinates by map_motif_finemo.
+                curated["region"] = (curated["chrom"] + ":"
+                                     + curated["start"].astype(str) + "-"
+                                     + curated["end"].astype(str))
+            seqs_ohe = self._positives_to_onehot(curated)
+            ids = curated["region"].astype(str).tolist()
+            logger.info(f"Computing attribution for {len(seqs_ohe)} regions, tracks={tracks}.")
+            compute_attribution(
+                model=self.model,
+                seqs_ohe=seqs_ohe,
+                tracks=tracks,
+                device=self.device,
+                n_refs=n_refs,
+                batch_size=attr_bs,
+                save_h5_path=self.files["attr_h5"],
+                ids=ids,
+            )
 
-        modisco_dir = os.path.join(self.data_dir, "modisco_input")
-        # prepare_modisco_input preserves the full sequence length (no trim).
-        # Motif discovery runs on a single track (the first requested one);
-        # tracks are kept separate because averaging regression+classification
-        # attributions produces a meaningless mix.
+        # Attribution H5 -> NPZ pair for the modisco CLI (first track only:
+        # averaging regression+classification attributions mixes signals).
         ohe_npz, hyp_npz = prepare_modisco_input(
             h5_path=self.files["attr_h5"],
-            out_dir=modisco_dir,
+            out_dir=os.path.join(self.motif_dir, "modisco_input"),
             track_index=0,
         )
         run_modisco(
@@ -772,215 +777,42 @@ class QuickStart:
             n_seqlets=n_seqlets,
             window=window,
         )
+        motifs = load_motifs(self.files["modisco_h5"], task_name="discovery")
+        pd.DataFrame([
+            {"motif_id": mid, "num_seqlets": m["num_seqlets"],
+             "task": m["task"], "length": m["cwm"].shape[0]}
+            for mid, m in motifs.items()
+        ]).to_csv(self.files["discovered_motifs"], index=False)
+        logger.info(f"Discovered {len(motifs)} motifs -> {self.files['discovered_motifs']}")
 
-        if save_motifs_csv:
-            motifs = load_motifs(
-                self.files["modisco_h5"],
-                task_name=task_name,
-                target_len=target_motif_len,
-            )
-            rows = [
-                {
-                    "motif_id": mid,
-                    "num_seqlets": m["num_seqlets"],
-                    "task": m["task"],
-                    "length": m["cwm"].shape[0],
-                }
-                for mid, m in motifs.items()
-            ]
-            pd.DataFrame(rows).to_csv(self.files["discovered_motifs"], index=False)
-            logger.info(f"Discovered {len(rows)} motifs -> {self.files['discovered_motifs']}")
-
-        logger.info(f"Motif discovery complete. Results: {self.files['modisco_h5']}")
-        return self.files["modisco_h5"]
-
-    def run_finemo(self,
-                   motif_db_h5=None,
-                   tracks=None,
-                   df_pos=None,
-                   n_refs=100,
-                   attr_batch_size=64,
-                   lam=0.7,
-                   max_steps=10000,
-                   top_frac=0.1,
-                   rank_by=None,
-                   drop_N=True,
-                   max_drop_frac=0.2):
-        """Scan sequences for motif hits with Fi-NeMo.
-
-        Runs: attribution (reused if available) -> NPZ prep ->
-        ``finemo call-hits`` -> annotated hits DataFrame. Requires the external
-        ``finemo`` binary on PATH.
-
-        Parameters
-        ----------
-        motif_db_h5 : str, optional
-            Motif database H5. Defaults to ``self.files["modisco_h5"]`` (i.e.
-            run :meth:`run_modisco` first). May also be a Fi-NeMo DB built by
-            :func:`deepISA.discover.finemo.build_finemo_db`.
-        tracks, df_pos, n_refs, attr_batch_size :
-            Forwarded to attribution. Ignored if ``self.files["attr_h5"]``
-            already exists (attributions are reused).
-        lam : float
-            Fi-NeMo lambda trade-off.
-        max_steps : int
-            Fi-NeMo optimization step budget.
-        top_frac, rank_by, drop_N, max_drop_frac :
-            Input-set curation, applied only when attribution is computed
-            fresh (same semantics as :meth:`run_modisco`; an existing
-            attribution H5 is reused unchanged).
-        """
-        if self.model is None:
-            raise ValueError("Model not defined. Call define_model() first.")
-        motif_db_h5 = motif_db_h5 or self.files["modisco_h5"]
-        if not os.path.exists(motif_db_h5):
-            raise FileNotFoundError(
-                f"Motif DB not found: {motif_db_h5}. "
-                "Run run_modisco() first or pass an explicit motif_db_h5."
-            )
-
-        tracks = list(tracks) if tracks is not None else list(getattr(self, "tracks", [0]))
-
-        # Reuse existing attribution when available; otherwise compute fresh
-        # (with the same input-set curation as run_modisco, so a fresh H5
-        # matches what run_modisco would have produced).
-        if not os.path.exists(self.files["attr_h5"]):
-            df_pos = self._resolve_positives(df_pos)
-            df_pos = self._select_modisco_regions(
-                df_pos, tracks, top_frac=top_frac, rank_by=rank_by, drop_N=drop_N,
-                max_drop_frac=max_drop_frac,
-            )
-            seqs_ohe = self._positives_to_onehot(df_pos)
-            ids = df_pos["region"].astype(str).tolist() if "region" in df_pos.columns else None
-            logger.info(f"Computing attribution for {len(seqs_ohe)} regions, tracks={tracks}.")
-            compute_attribution(
-                model=self.model,
-                seqs_ohe=seqs_ohe,
-                tracks=tracks,
-                device=self.device,
-                n_refs=n_refs,
-                batch_size=attr_batch_size,
-                save_h5_path=self.files["attr_h5"],
-                ids=ids,
-            )
-
-        # Build finemo NPZ from the (channel-first) attribution H5.
-        # Reuse the first track (consistent with run_modisco).
-        from deepISA.discover.modisco import read_attribution_h5
-        seqs_4lc, hyp_4lc, _ = read_attribution_h5(self.files["attr_h5"], track_index=0)
+        # Fi-NeMo scan of the SAME regions the attribution covered. The region
+        # ids stored in the H5 become Fi-NeMo's peak_name, which
+        # map_motif_finemo parses back into genomic coordinates.
+        seqs_4lc, hyp_4lc, _ = read_attribution_h5(
+            self.files["attr_h5"], track_index=0)
+        import h5py
+        with h5py.File(self.files["attr_h5"], "r") as f:
+            if "id" not in f:
+                raise ValueError(
+                    f"{self.files['attr_h5']} has no region ids (written by an "
+                    "older flow). Delete it so attribution is recomputed with ids."
+                )
+            region_ids = [s.decode() if isinstance(s, bytes) else str(s)
+                          for s in f["id"][:]]
         finemo_npz = build_finemo_input(
             seqs_ohe=seqs_4lc,
             hyp_scores=hyp_4lc,
             out_dir=os.path.dirname(self.files["finemo_npz"]),
-            ids=None,
+            ids=region_ids,
         )
-
         hits_tsv = run_finemo_scan(
             npz_path=finemo_npz,
             out_dir=os.path.dirname(self.files["finemo_hits"]),
-            motif_db_h5=motif_db_h5,
+            motif_db_h5=self.files["modisco_h5"],
             lam=lam,
             max_steps=max_steps,
         )
-        df_hits = load_hits_with_annotation(hits_tsv, motif_db_h5)
-        df_hits.to_csv(self.files["finemo_hits"], sep="\t", index=False)
+        df_hits = load_hits_with_annotation(hits_tsv, self.files["modisco_h5"])
+        df_hits.to_csv(self.files["finemo_hits"], sep="	", index=False)
         logger.info(f"Fi-NeMo hits ({len(df_hits)} rows) -> {self.files['finemo_hits']}")
         return df_hits
-
-    def run_motif_discovery(self,
-                            tracks=None,
-                            df_pos=None,
-                            do_modisco=True,
-                            do_finemo=True,
-                            motif_db_h5=None,
-                            **kwargs):
-        """One-call orchestrator: tf-modisco-lite -> Fi-NeMo.
-
-        Convenience wrapper that runs :meth:`run_modisco` (if ``do_modisco``)
-        then :meth:`run_finemo` (if ``do_finemo``), sharing the attribution H5.
-        Any extra ``kwargs`` are split between the two methods by keyword.
-        """
-        modisco_keys = {"n_refs", "attr_batch_size", "window", "n_seqlets",
-                        "task_name", "target_motif_len", "save_motifs_csv",
-                        "top_frac", "rank_by", "drop_N", "max_drop_frac"}
-        finemo_keys = {"lam", "max_steps",
-                       "top_frac", "rank_by", "drop_N", "max_drop_frac"}
-        unknown = set(kwargs) - modisco_keys - finemo_keys
-        if unknown:
-            logger.warning(f"run_motif_discovery ignoring unknown kwargs: {sorted(unknown)}")
-
-        if do_modisco:
-            self.run_modisco(
-                tracks=tracks,
-                df_pos=df_pos,
-                **{k: v for k, v in kwargs.items() if k in modisco_keys},
-            )
-        if do_finemo:
-            self.run_finemo(
-                motif_db_h5=motif_db_h5,
-                tracks=tracks,
-                df_pos=df_pos,
-                **{k: v for k, v in kwargs.items() if k in finemo_keys},
-            )
-
-    # ------------------------------------------------------------------
-    # Motif report: tf-modisco-lite HTML report + MEME/TOMTOM annotation
-    # ------------------------------------------------------------------
-    def run_motif_report(self,
-                        meme_db=None,
-                        task_name="discovery",
-                        target_motif_len=40,
-                        export_meme=True):
-        """Generate the tf-modisco-lite HTML report, optionally with TOMTOM.
-
-        Runs ``modisco report`` on :attr:`self.files["modisco_h5"]`, writing the
-        HTML report (logos + seqlet tables) to :attr:`self.files["motif_report"]`.
-
-        Parameters
-        ----------
-        meme_db : str, optional
-            Path to a MEME-format motif database (e.g. JASPAR). When provided,
-            tf-modisco-lite runs TOMTOM and annotates each discovered motif with
-            its best known-TF match. If ``None``, only the unannotated report is
-            produced.
-        task_name : str
-            Prefix for motif ids when exporting the MEME file (forwarded to
-            :func:`deepISA.discover.h5_io.load_motifs`).
-        target_motif_len : int
-            Length to normalize motifs to when exporting the MEME file.
-        export_meme : bool
-            If True, also export discovered motifs to a MEME file at
-            :attr:`self.files["discovered_meme"]` (useful for standalone TOMTOM
-            runs against external databases).
-
-        Returns
-        -------
-        str
-            The report directory path.
-
-        Raises
-        ------
-        FileNotFoundError
-            If :attr:`self.files["modisco_h5"]` does not exist (run
-            :meth:`run_modisco` first).
-        """
-        if not os.path.exists(self.files["modisco_h5"]):
-            raise FileNotFoundError(
-                f"modisco results not found: {self.files['modisco_h5']}. "
-                "Run run_modisco() first."
-            )
-
-        if export_meme:
-            motifs = load_motifs(
-                self.files["modisco_h5"],
-                task_name=task_name,
-                target_len=target_motif_len,
-            )
-            cwm_to_meme(motifs, self.files["discovered_meme"])
-            logger.info(f"Discovered motifs exported to MEME: {self.files['discovered_meme']}")
-
-        return run_motif_report(
-            modisco_h5=self.files["modisco_h5"],
-            out_dir=self.files["motif_report"],
-            meme_db=meme_db,
-        )
